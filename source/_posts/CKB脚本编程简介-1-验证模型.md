@@ -50,4 +50,7 @@ pub struct CellOutput {
 
 这就是`type`脚本的用武之地：`type`脚本用于验证 Cell 转换阶段的某些规则。这里的一些例子包括：
 
-* 
+* 验证UDT（用户定义的Token）余额以确保不会无效地发出新Token。
+
+
+
