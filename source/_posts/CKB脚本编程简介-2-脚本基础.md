@@ -21,7 +21,7 @@ category:
 
 在本文以及整个系列文章内，我们将区分脚本和脚本代码。脚本代码实际上是指你编写和编译并在 CKB 上运行的程序。而脚本，实际上是指 CKB 中使用的脚本数据结构，它会比脚本代码稍微多一点点：
 
-```rust
+```c
 pub struct Script {
     pub args: Vec<Bytes>,
     pub code_hash: H256,
@@ -35,4 +35,72 @@ pub struct Script {
 
 ## 一个最小的 CKB 脚本代码
 
-你可能之前就已经听所过了，CKB （编者注：此处指的应该是 CKB-VM）是基于开源的 RISC-V 指令集编写的。但这到底意味着什么呢？用我自己的话来说，这意味着我们（在某种程度上）在 CKB 中嵌入了一台真正的微型计算机，而不是一台虚拟机。一台真正的计算机的好处是，你可以用任何语言编写任何你想写的逻辑。在这里，我们展示的前面几个例子将会用 C语言编写，以保持简单性（我是说工具链中的简单性，而不是[语言](http://blog.llvm.org/2011/05/what-every-c-programmer-should-know.html)），之后我们还会切换到基于 JavaScript 的脚本代码，并希望在本系列中展示更多的语言。记住，在 CKB 上有无限的可能。
+你可能之前就已经听所过了，CKB （编者注：此处指的应该是 CKB VM）是基于开源的 RISC-V 指令集编写的。但这到底意味着什么呢？用我自己的话来说，这意味着我们（在某种程度上）在 CKB 中嵌入了一台真正的微型计算机，而不是一台虚拟机。一台真正的计算机的好处是，你可以用任何语言编写任何你想写的逻辑。在这里，我们展示的前面几个例子将会用 C语言编写，以保持简单性（我是说工具链中的简单性，而不是[语言](http://blog.llvm.org/2011/05/what-every-c-programmer-should-know.html)），之后我们还会切换到基于 JavaScript 的脚本代码，并希望在本系列中展示更多的语言。记住，在 CKB 上有无限的可能！
+
+正如我们提到的，CKB VM 更像是一台真正的微型计算机。CKB 的代码脚本看起来也更像是我们在电脑上跑的一个常见的 Unix 风格的可执行程序。
+
+```c
+int main(int argc, char* argv[])
+{
+  return 0;
+}
+```
+
+当你的代码通过 C 编译器编译时，它将成为可以在 CKB 上运行的脚本代码。换句话说，CKB 只是采用了普通的旧式 Unix 风格的可执行程序(但使用的是 RISC-V 体系结构，而不是流行的 x86 体系结构)，并在虚拟机环境中运行它。如果程序的返回代码是 0 ，我们认为脚本成功了，所有非零的返回代码都将被视为失败脚本。
+
+在上面的例子中，我们展示了一个总是成功的脚本代码。因为返回代码总是 0。但是请不要使用这个作为您的 lock script code ，否则您的 token 可能会被任何人拿走。
+
+但是显然上面的例子并不有趣，这里我们从一个有趣的想法开始:我个人不是很喜欢胡萝卜。我知道胡萝卜从营养的角度来看是很好的，但我还是想要避免它的味道。如果现在我想设定一个规则，比如我想让我在 CKB 上的 Cell 里面都没有以`carrot`开头的数据?让我们编写一个脚本代码来实现这一点。
+
+为了确保没有一个 cell 在 cell data
+中包含`carrot`，我们首先需要一种方法来读取脚本中的 cell data。CKB 提供了`syscalls`来帮助解决这个问题。
+
+为了确保 CKB 脚本的安全性，每个脚本都必须在与运行 CKB 的主计算机完全分离的隔离环境中运行。这样它就不能访问它不需要的数据，比如你的私钥或密码。然而，要使得脚本有用，必须有特定的数据要访问，比如脚本保护的 cell 或脚本验证的事务。CKB 提供了`syscalls`来确保这一点，`syscalls`是在 RISC-V 的标准中定义的，它们提供了访问环境中某些资源的方法。在正常情况下，这里的环境指的是操作系统，但是在 CKB VM  中，环境指的是实际的 CKB 进程。使用`syscalls`， CKB脚本可以访问包含自身的整个事务，包括输入（inputs）、输出（outpus）、见证（witnesses）和 deps。
+
+好消息是，我们已经将`syscalls`封装在了一个易于使用的头文件中，非常欢迎您在这里[查看这个文件](https://github.com/nervosnetwork/ckb-system-scripts/blob/66d7da8ec72dffaa7e9c55904833951eca2422a9/c/ckb_syscalls.h)，了解如何实现`syscalls`。最重要的是，您可以只获取这个头文件并使用包装函数来创建您想要的系统调用。
+
+现在有了`syscalls`，我们可以从禁止使用`carrot`的脚本开始:
+
+```c
+#include <memory.h>
+#include "ckb_syscalls.h"
+
+int main(int argc, char* argv[]) {
+  int ret;
+  size_t index = 0;
+  volatile uint64_t len = 0; /* (1) */
+  unsigned char buffer[6];
+
+  while (1) {
+    len = 6;
+    memset(buffer, 0, 6);
+    ret = ckb_load_cell_by_field(buffer, &len, 0, index, CKB_SOURCE_OUTPUT,
+                                 CKB_CELL_FIELD_DATA); /* (2) */
+    if (ret == CKB_INDEX_OUT_OF_BOUND) {               /* (3) */
+      break;
+    }
+
+    if (memcmp(buffer, "carrot", 6) == 0) {
+      return -1;
+    }
+
+    index++;
+  }
+
+  return 0;
+}
+```
+
+以下几点需要解释一下：
+
+ 1. 由于 C 语言的怪癖，`len`字段需要标记为`volatile`。我们会同时使用它作为输入和输出参数，CKB VM 只能在它还保存在内存中时，才可以把它设置输出参数。而`volatile`可以确保 C 编译器将它保存为基于 RISC-V 内存的变量。
+ 
+ 2. 在使用`syscall`时，我们需要提供以下功能：一个缓冲区来保存`syscall`提供的数据；一个`len`字段，来表示系统调用返回的缓冲区长度和可用数据长度；一个输入数据缓冲区中的偏移量，以及几个我们在交易中需要获取的确切字段的参数。详情请参阅我们的[RFC](https://github.com/nervosnetwork/rfcs/blob/master/rfcs/0009-vm-syscalls/0009-vm-syscalls.md)。
+
+ 3. 为了保证最大的灵活性，CKB 使用系统调用的返回值来表示数据抓取状态:0 (or `CKB_SUCCESS`) 意味着成功，1 (or `CKB_INDEX_OUT_OF_BOUND`) 意味着您已经通过一种方式获取了所有的索引，2 (or`CKB_ITEM_MISSING`) 意味着不存在一个实体，比如从一个不包含该类型脚本的 cell 中获取该类型的脚本。
+
+概况一下，这个脚本将循环遍历交易中的所有输出 cells，加载每个 cell data 的前6个字节，并测试这些字节是否和`carrot`匹配。如果找到匹配，脚本将返回`-1`，表示错误状态；如果没有找到匹配，脚本将返回`0`退出，表示执行成功。
+
+为了执行该循环，该脚本将保存一个`index`变量，在每次循环迭代中，它将试图让 syscall 获取 cell 中目前采用的`index`值，如果 syscall 返回`CKB_INDEX_OUT_OF_BOUND`，这意味着脚本已经遍历所有的 cell，之后会退出循环；否则，循环将继续，每测试 cell data 一次，`index`变量就会递增一次。
+  
+这是第一个有用的 CKB 脚本代码！在下一节中，我们将看到我们是如何将其部署到 CKB 中并运行它的。
