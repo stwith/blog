@@ -202,3 +202,246 @@ from /home/ubuntu/code/ckb-sdk-ruby/lib/ckb/rpc.rb:164:in `rpc_request'
 
 在这里我们可以提供的一个技巧是，始终将您的脚本作为一个 type 脚本附加到你交易的一个 output cell 中去进行测试，这样，发生错误时，您可以立即知道，并且您的 token 可以始终保持安全。
 
+## 分析默认 lock 脚本代码
+
+根据已经掌握的知识，让我们看看 CKB 中包含的默认的 lock 脚本代码。 为了避免混淆，我们正在查看 lock 脚本代码在 [这个commit](https://github.com/nervosnetwork/ckb-system-scripts/blob/66e2b3fc4fa3e80235e4b4f94a16e81352a812f7/c/secp256k1_blake160_sighash_all.c)。
+
+默认的 lock 脚本代码将循环遍历与自身具有相同 lock 脚本的所有的 input cell，并执行以下步骤:
+
+* 它通过提供的 syscall 获取当前的交易 hash
+
+* 它获取相应的 witness 数据作为当前输入
+
+* 对于默认 lock 脚本，假设 witness 中的第一个参数包含由 cell 所有者签名的可恢复签名，其余参数是用户提供的可选参数
+
+* 默认的 lock 脚本运行 由交易 hash 链接的二进制程序的 blake2b hash， 还有所有用户提供的参数(如果存在的话)
+
+* 将 blake2b hash 结果用作 secp256k1 签名验证的消息部分。注意，witness 数据结构中的第一个参数提供了实际的签名。
+
+* 如果签名验证失败，脚本退出并返回错误码。否则它将继续下一个迭代。
+
+
+注意，我们在前面讨论了脚本和脚本代码之间的区别。每一个不同的公钥 hash 都会产生不同的 lock 脚本，因此，如果一个交易的输入 cell 具有相同的默认 lock 脚本代码，但具有不同的公钥 hash(因此具有不同的 lock 脚本)，将执行默认 lock 脚本代码的多个实例，每个实例都有一组共享相同 lock 脚本的 cell。
+
+现在我们可以遍历默认 lock 脚本代码的不同部分:
+
+```
+if (argc != 2) {
+  return ERROR_WRONG_NUMBER_OF_ARGUMENTS;
+}
+
+secp256k1_context context;
+if (secp256k1_context_initialize(&context, SECP256K1_CONTEXT_VERIFY) == 0) {
+  return ERROR_SECP_INITIALIZE;
+}
+
+len = BLAKE2B_BLOCK_SIZE;
+ret = ckb_load_tx_hash(tx_hash, &len, 0);
+if (ret != CKB_SUCCESS) {
+  return ERROR_SYSCALL;
+}
+```
+
+当参数包含在 `Script`数据结构的 `args`部分， 它们通过 Unix 传统的`arc`/`argv`方式发送给实际运行的脚本程序。
+为了进一步保持约定，我们在`argv[0]` 处插入一个伪参数，所以 第一个包含的参数从`argv[1]`开始。
+在默认 lock 脚本代码的情况下，它接受一个参数，即从所有者的私钥生成的公钥 hash。
+
+```
+ret = ckb_load_input_by_field(NULL, &len, 0, index, CKB_SOURCE_GROUP_INPUT,
+                             CKB_INPUT_FIELD_SINCE);
+if (ret == CKB_INDEX_OUT_OF_BOUND) {
+  return 0;
+}
+if (ret != CKB_SUCCESS) {
+  return ERROR_SYSCALL;
+}
+```
+
+
+使用与胡萝卜这个例子相同的技术，我们检查是否有更多的输入 cell 要测试。与之前的例子有两个不同:
+
+* 如果我们只想知道一个 cell 是否存在并且不需要任何数据，我们只需要传入`NULL` 作为数据缓冲区，一个 `len` 变量的值是 0。
+通过这种方式，syscall 将跳过数据填充，只提供可用的数据长度和正确的返回码用于处理。
+
+* 在这个 carrot 的例子中，我们循环遍历交易中的所有输入， 但这里我们只关心具有相同 lock 脚本的输入cell。 CKB将具有相同锁定(或类型)脚本的`cell`命名为`group`。 我们可以使用 `CKB_SOURCE_GROUP_INPUT` 代替 `CKB_SOURCE_INPUT`， 来表示只计算同一组中的 cell，举个例子，即具有与当前 cell 相同的 lock 脚本的 cells。
+
+```
+len = WITNESS_SIZE;
+ret = ckb_load_witness(witness, &len, 0, index, CKB_SOURCE_GROUP_INPUT);
+if (ret != CKB_SUCCESS) {
+  return ERROR_SYSCALL;
+}
+if (len > WITNESS_SIZE) {
+  return ERROR_WITNESS_TOO_LONG;
+}
+
+if (!(witness_table = ns(Witness_as_root(witness)))) {
+  return ERROR_ENCODING;
+}
+args = ns(Witness_data(witness_table));
+if (ns(Bytes_vec_len(args)) < 1) {
+  return ERROR_WRONG_NUMBER_OF_ARGUMENTS;
+}
+```
+
+继续沿着这个路径，我们正在加载当前输入的 witness。 对应的 witness 和输入具有相同的索引。
+现在 CKB 在 syscalls 中使用`flatbuffer`作为序列化格式，所以如果你很好奇，[flatcc的文档](https://github.com/dvidelabs/flatcc)是你最好的朋友。
+
+```
+/* Load signature */
+len = TEMP_SIZE;
+ret = extract_bytes(ns(Bytes_vec_at(args, 0)), temp, &len);
+if (ret != CKB_SUCCESS) {
+  return ERROR_ENCODING;
+}
+
+/* The 65th byte is recid according to contract spec.*/
+recid = temp[RECID_INDEX];
+/* Recover pubkey */
+secp256k1_ecdsa_recoverable_signature signature;
+if (secp256k1_ecdsa_recoverable_signature_parse_compact(&context, &signature, temp, recid) == 0) {
+  return ERROR_SECP_PARSE_SIGNATURE;
+}
+blake2b_state blake2b_ctx;
+blake2b_init(&blake2b_ctx, BLAKE2B_BLOCK_SIZE);
+blake2b_update(&blake2b_ctx, tx_hash, BLAKE2B_BLOCK_SIZE);
+for (size_t i = 1; i < ns(Bytes_vec_len(args)); i++) {
+  len = TEMP_SIZE;
+  ret = extract_bytes(ns(Bytes_vec_at(args, i)), temp, &len);
+  if (ret != CKB_SUCCESS) {
+    return ERROR_ENCODING;
+  }
+  blake2b_update(&blake2b_ctx, temp, len);
+}
+blake2b_final(&blake2b_ctx, temp, BLAKE2B_BLOCK_SIZE);
+```
+
+witness 中的第一个参数是要加载的签名，而其余的参数(如果提供的话)被附加到用于 blake2b 操作的交易 hash 中。
+
+```
+secp256k1_pubkey pubkey;
+
+if (secp256k1_ecdsa_recover(&context, &pubkey, &signature, temp) != 1) {
+  return ERROR_SECP_RECOVER_PUBKEY;
+}
+```
+
+然后使用哈希后的 blake2b 结果作为信息，进行 secp256 签名验证。
+
+```
+size_t pubkey_size = PUBKEY_SIZE;
+if (secp256k1_ec_pubkey_serialize(&context, temp, &pubkey_size, &pubkey, SECP256K1_EC_COMPRESSED) != 1 ) {
+  return ERROR_SECP_SERIALIZE_PUBKEY;
+}
+
+len = PUBKEY_SIZE;
+blake2b_init(&blake2b_ctx, BLAKE2B_BLOCK_SIZE);
+blake2b_update(&blake2b_ctx, temp, len);
+blake2b_final(&blake2b_ctx, temp, BLAKE2B_BLOCK_SIZE);
+
+if (memcmp(argv[1], temp, BLAKE160_SIZE) != 0) {
+  return ERROR_PUBKEY_BLAKE160_HASH;
+}
+```
+
+最后同样重要的是，我们还需要检查可恢复签名中包含的 pubkey 确实是用于生成 lock 脚本参数中包含的 pubkey hash 的 pubkey。
+否则，可能会有人使用另一个公钥生成的签名来窃取你的 token。
+
+简而言之，默认 lock 脚本中使用的方案与现在[比特币中使用的方案](https://bitcoin.org/en/transactions-guide#p2pkh-script-validation)非常相似。
+
+## 介绍 Duktape
+
+我相信你和我现在的感觉一样: 我们可以用 C 语言写合约，这很好，但是 C 语言总是让人觉得有点乏味，而且，让我们面对现实，它很危险。
+有更好的方法吗?
+
+当然！ 我们上面提到的 CKB VM 本质上是一台微型计算机，我们可以探索很多解决方案。 我们在这里做的一件事是，使用 JavaScript 编写 CKB 脚本代码。 是的，你说对了，简单的 ES5 (是的，我知道，但这只是一个例子，你可以使用转换器) JavaScript。
+
+这怎么可能呢? 由于我们有 C 编译器,我们只需为嵌入式系统使用一个 JavaScript 实现，在我们的例子中，[duktape](https://duktape.org/)
+将它从 C 编译成 RISC-V 二进制文件，把它放在链上，我们就可以在 CKB 上运行 JavaScript 了!因为我们使用的是一台真正的微型计算机，所以没有什么可以阻止我们将另一个 VM 作为 CKB 脚本嵌入到 CKB VM 中，并在 VM 路径上探索这个 VM。
+
+从这条路径展开，我们可以通过 duktape 在 CKB 上使用 JavaScript，我们也可以通过 [mruby](https://github.com/mruby/mruby)在 ckb 上使用 Ruby， 我们甚至可以将比特币脚本或EVM放到链上，我们只需要编译他们的虚拟机，并把它放在链上。这确保了 CKB VM 既能帮助我们保存资产，又能构建一个多样化的生态系统。所有的语言都应该在 CKB 上被平等对待，自由应该掌握在区块链合约的开发者手中。
+
+在这个阶段，你可能想问: 是的，这是可能的，但是 VM 之上的 VM 不会很慢吗? 我相信这取决于你的例子是否很慢。我坚信，基准测试没有任何意义，除非我们将它放在具有标准硬件需求的实际用例中。 所以我们需要有时间检验这是否真的会成为一个问题。 在我看来，高级语言更可能用于 type scripts 来保护 cell 转换，在这种情况下，我怀疑它会很慢。此外，我们也在这个领域努力工作，以优化 CKB VM 和 VMs 之上的 CKB VM，使其越来越快，:P
+
+
+要在 CKB 上使用 duktape，首先需要将 duktape 本身编译成 RISC-V 可执行二进制文件:
+
+```
+$ git clone https://github.com/nervosnetwork/ckb-duktape
+$ cd ckb-duktape
+$ sudo docker run --rm -it -v `pwd`:/code nervos/ckb-riscv-gnu-toolchain:xenial bash
+root@0d31cad7a539:~# cd /code
+root@0d31cad7a539:/code# make
+riscv64-unknown-elf-gcc -Os -DCKB_NO_MMU -D__riscv_soft_float -D__riscv_float_abi_soft -Iduktape -Ic -Wall -Werror c/entry.c -c -o build/entry.o
+riscv64-unknown-elf-gcc -Os -DCKB_NO_MMU -D__riscv_soft_float -D__riscv_float_abi_soft -Iduktape -Ic -Wall -Werror duktape/duktape.c -c -o build/duktape.o
+riscv64-unknown-elf-gcc build/entry.o build/duktape.o -o build/duktape -lm -Wl,-static -fdata-sections -ffunction-sections -Wl,--gc-sections -Wl,-s
+root@0d31cad7a539:/code# exit
+exit
+$ ls build/duktape
+build/duktape*
+```
+
+与 carrot 示例一样，这里的第一步是在 CKB cell 中部署 duktape 脚本代码:
+
+```ruby
+pry(main)> data = File.read("../ckb-duktape/build/duktape")
+pry(main)> duktape_data.bytesize
+=> 269064
+pry(main)> duktape_tx_hash = wallet.send_capacity(wallet.address, CKB::Utils.byte_to_shannon(280000), CKB::Utils.bin_to_hex(duktape_data))
+pry(main)> duktape_data_hash = CKB::Blake2b.hexdigest(duktape_data)
+pry(main)> duktape_out_point = CKB::Types::OutPoint.new(cell: CKB::Types::CellOutPoint.new(tx_hash: duktape_tx_hash, index: 0))
+```
+
+与 carrot 的例子不同，duktape 脚本代码现在需要一个参数: 要执行的 JavaScript 源代码:
+
+```ruby
+pry(main)> duktape_hello_type_script = CKB::Types::Script.new(code_hash: duktape_data_hash, args: [CKB::Utils.bin_to_hex("CKB.debug(\"I'm running in JS!\")")])
+```
+
+注意，使用不同的参数，你可以为不同的用例创建不同的 duktape 支持的 type script：
+
+```ruby
+pry(main)> duktape_hello_type_script = CKB::Types::Script.new(code_hash: duktape_data_hash, args: [CKB::Utils.bin_to_hex("var a = 1;\nvar b = a + 2;")])
+```
+
+这反映了上面提到的脚本代码与脚本之间的差异：这里 duktape 作为提供 JavaScript 引擎的脚本代码，而不同的脚本利用 duktape 脚本代码在链上提供不同的功能。
+
+
+现在我们可以创建一个 cell 与 duktape 的 type script 附件:
+
+```ruby
+pry(main)> tx = wallet.generate_tx(wallet2.address, CKB::Utils.byte_to_shannon(200))
+pry(main)> tx.deps.push(duktape_out_point.dup)
+pry(main)> tx.outputs[0].instance_variable_set(:@type, duktape_hello_type_script.dup)
+pry(main)> tx.witnesses[0].data.clear
+pry(main)> tx = tx.sign(wallet.key, api.compute_transaction_hash(tx))
+pry(main)> api.send_transaction(tx)
+=> "0x2e4d3aab4284bc52fc6f07df66e7c8fc0e236916b8a8b8417abb2a2c60824028"
+```
+
+我们可以看到脚本执行成功，如果在`ckb.toml` 文件中将 `ckb-script`日志模块的级别设置为`debug`，你可以看到以下日志:
+
+```bash
+2019-07-15 05:59:13.551 +00:00 http.worker8 DEBUG ckb-script  script group: c35b9fed5fc0dd6eaef5a918cd7a4e4b77ea93398bece4d4572b67a474874641 DEBUG OUTPUT: I'm running in JS!
+```
+
+现在您已经成功地在 CKB 上部署了一个 JavaScript 引擎，并在 CKB 上运行基于 JavaScript 的脚本!
+你可以在这里尝试认识的 JavaScript 代码。
+
+## 一道思考题
+
+现在你已经熟悉了 CKB 脚本的基础知识，下面是一个思考：
+在本文中，您已经看到了一个 always-success 的脚本是什么样子的，但是一个 always-failure 的脚本呢?
+一个 always-failure 脚本(和脚本代码)能有多小?
+
+提示：这不是 gcc 优化比赛，这只是一个思考。
+
+## 下集预告
+
+我知道这是一个很长的帖子，我希望你已经尝试过，并成功地部署了一个脚本到 CKB。在下一篇文章中，我们将介绍一个重要的主题:如何在 CKB 定义自己的用户定义 token(UDT)。CKB 上 udt 最好的部分是，每个用户都可以将自己的 udt 存储在自己的 cell 中，这与 Ethereum 上的 ERC20 令牌不同，
+在 Ethereum 上，每个人的 token 都必须位于 token 发起者的单个地址中。所有这些都可以通过单独使用 type script 来实现。
+如果你感兴趣，请继续关注 :)
+
+本文作者：Xuejie
+原文链接：https://xuejie.space/2019_07_13_introduction_to_ckb_script_programming_script_basics/
+本文译者：Shooter，Jason，Orange
