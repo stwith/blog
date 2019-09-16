@@ -80,7 +80,9 @@ Polyjuice 通过本地的服务，对外提供Web3的接口，完美的兼容了
 
 ## 小结
 
-呐，以上是Polyjuice的Ethereum的基本逻辑。是不是感觉少了点什么？ 
+呐，以上是Polyjuice的Ethereum的基本逻辑。是不是感觉少了点什么？ 有点意犹未尽的样子。
 
-下一篇我们会讲Polyjuice是如何实现Ethereum上的合约模型的，敬请期待（欢迎打钱）
+下一篇我们会讲Polyjuice的精华部分，是怎么与EVM结合，实现Ethereum On CKB 的合约部分。
+
+敬请期待（欢迎打钱）
 
