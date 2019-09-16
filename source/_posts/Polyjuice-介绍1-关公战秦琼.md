@@ -9,8 +9,6 @@ category:
 - Nervos
 ---
 
-# Polyjuice 介绍1: 关公战秦琼
-
 ![](https://i.loli.net/2019/09/16/b4ajfvXK5xSnu92.jpg)
 
 ### Polyjuice 是什么？ 
