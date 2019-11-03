@@ -25,7 +25,7 @@ category:
 
 # AssemblyScript
 
-我相信没有比演示更能说明问题的了。所以，让我们试试官方的 AssemblyScript，然后在 CKB 上运行编译好的程序。我们将只使用 AssemblyScript 简介页面中的[官方示例]()：
+我相信没有比演示更能说明问题的了。所以，让我们试试官方的 AssemblyScript，然后在 CKB 上运行编译好的程序。我们将只使用 AssemblyScript 简介页面中的[官方示例](https://docs.assemblyscript.org/)：
 
 ```
 $ cat fib.ts
